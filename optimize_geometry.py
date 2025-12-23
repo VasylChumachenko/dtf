@@ -24,7 +24,7 @@ import os
 import numpy as np
 
 from ase import io
-from ase.optimize import LBFGS
+from ase.optimize import LBFGS, FIRE
 from ase.constraints import ExpCellFilter  # More stable than UnitCellFilter
 from ase.parallel import parprint, world
 
@@ -145,7 +145,7 @@ def main():
         occupations=FermiDirac(args.smearing),
         kpts=kpts,
         txt=gpaw_log,
-        convergence={"energy": 1e-5, "density": 1e-6},
+        convergence={"energy": 1e-4, "density": 1e-4},
         symmetry="off",  # Required for cell optimization
         parallel=parallel_opts
     )
@@ -171,6 +171,10 @@ def main():
         parprint(f"  Stage 1 complete. Energy: {atoms.get_potential_energy():.6f} eV")
 
     # Main optimization (cell + positions)
+    # Using FIRE + LBFGS approach (best practice):
+    # 1) FIRE for quick pre-relax (robust, handles rough geometries)
+    # 2) LBFGS for accurate finish (fast near minimum)
+    
     parprint("\n=== Cell + position optimization ===")
 
     if args.fix_c:
@@ -183,8 +187,17 @@ def main():
         ecf = ExpCellFilter(atoms)
         parprint("  Mode: full cell relaxation")
 
-    optimizer = LBFGS(ecf, trajectory=traj_file, logfile=None)
-    optimizer.run(fmax=args.fmax, steps=args.steps)
+    # Stage 1: FIRE pre-relax (robust for rough geometries)
+    parprint("\n  [1/2] FIRE pre-relax (fmax=0.1)...")
+    fire_opt = FIRE(ecf, trajectory=f"{base_name}_fire.traj", logfile=None)
+    fire_opt.run(fmax=0.1, steps=50)
+    f_after_fire = np.sqrt((atoms.get_forces() ** 2).sum(axis=1)).max()
+    parprint(f"        FIRE done. fmax={f_after_fire:.4f} eV/Å")
+
+    # Stage 2: LBFGS finish (fast convergence near minimum)
+    parprint(f"\n  [2/2] LBFGS finish (fmax={args.fmax})...")
+    lbfgs_opt = LBFGS(ecf, trajectory=traj_file, logfile=None)
+    lbfgs_opt.run(fmax=args.fmax, steps=args.steps)
 
     # Final results
     e1 = atoms.get_potential_energy()
