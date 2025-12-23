@@ -44,19 +44,23 @@ def get_min_distance(atoms):
 def pick_kpt_parallel(world_size: int, kpts) -> dict:
     """
     Choose safe k-point parallelization.
-    GPAW requires kpt parallel groups to divide number of k-points.
+    GPAW requires:
+    1. kpt groups must divide number of k-points
+    2. world_size must be divisible by kpt groups
     """
     nk = int(np.prod(kpts))
     if world_size <= 1:
         return None
 
-    # Find largest divisor of nk that is <= world_size
-    divisors = [d for d in range(1, world_size + 1) if nk % d == 0]
-    kpt_groups = max(divisors) if divisors else 1
+    # Find largest value that divides BOTH nk and world_size
+    # This ensures valid k-point parallelization
+    valid_kpt_groups = [d for d in range(1, world_size + 1) 
+                        if nk % d == 0 and world_size % d == 0]
+    kpt_groups = max(valid_kpt_groups) if valid_kpt_groups else 1
 
     if kpt_groups == 1:
-        # No useful k-point parallelism possible
-        return {'domain': 1, 'band': 1}
+        # No useful k-point parallelism, let GPAW decide
+        return None
 
     return {'kpt': kpt_groups, 'domain': 1, 'band': 1}
 
