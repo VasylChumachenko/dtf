@@ -166,7 +166,7 @@ def main():
     # Two-stage optimization
     if args.two_stage:
         parprint("\n=== Stage 1: Position relaxation (cell fixed) ===")
-        opt1 = LBFGS(atoms, trajectory=f"{base_name}_stage1.traj", logfile=None)
+        opt1 = LBFGS(atoms, trajectory=f"{base_name}_stage1.traj", logfile='-')
         opt1.run(fmax=0.1, steps=50)
         parprint(f"  Stage 1 complete. Energy: {atoms.get_potential_energy():.6f} eV")
 
@@ -189,14 +189,14 @@ def main():
 
     # Stage 1: FIRE pre-relax (robust for rough geometries)
     parprint("\n  [1/2] FIRE pre-relax (fmax=0.1)...")
-    fire_opt = FIRE(ecf, trajectory=f"{base_name}_fire.traj", logfile=None)
+    fire_opt = FIRE(ecf, trajectory=f"{base_name}_fire.traj", logfile='-')  # '-' = print to terminal
     fire_opt.run(fmax=0.1, steps=50)
     f_after_fire = np.sqrt((atoms.get_forces() ** 2).sum(axis=1)).max()
     parprint(f"        FIRE done. fmax={f_after_fire:.4f} eV/Å")
 
     # Stage 2: LBFGS finish (fast convergence near minimum)
     parprint(f"\n  [2/2] LBFGS finish (fmax={args.fmax})...")
-    lbfgs_opt = LBFGS(ecf, trajectory=traj_file, logfile=None)
+    lbfgs_opt = LBFGS(ecf, trajectory=traj_file, logfile='-')  # '-' = print to terminal
     lbfgs_opt.run(fmax=args.fmax, steps=args.steps)
 
     # Final results
