@@ -3,7 +3,7 @@ Geometry optimization script for CIF file using GPAW.
 
 Usage:
     gpaw python optimize_geometry.py input.cif
-    mpirun -n 4 gpaw python optimize_geometry.py input.cif [options]
+    mpirun -n 4 gpaw python -- optimize_geometry.py input.cif [options]
 
 Options:
     --ecut       Plane-wave cutoff in eV (default: 500)
@@ -13,14 +13,26 @@ Options:
     --steps      Max optimization steps (default: 200)
     --fix-c      Fix c parameter (for 2D/slab with vacuum along c)
     --two-stage  First relax positions, then cell+positions
+    --supercell  Create supercell before optimization (e.g., 2 2 1)
+    --dry-run    Print structure info only, don't run calculation
+    --fast       Coarse pre-optimization then refine (RECOMMENDED for good initial geometries)
+    --symmetry   Use symmetry to reduce k-points (faster, but not for cell optimization)
 
 Example:
-    mpirun -n 4 gpaw python optimize_geometry.py C3N4.cif --ecut 500 --fmax 0.03
-    mpirun -n 4 gpaw python optimize_geometry.py slab.cif --fix-c --kpts 6 6 1
+    # Fast optimization of well-optimized structure
+    mpirun -n 4 gpaw python -- optimize_geometry.py g_c3n4.cif --fast --fix-c --kpts 4 4 1
+
+    # Full optimization
+    mpirun -n 4 gpaw python -- optimize_geometry.py C3N4.cif --ecut 500 --fmax 0.03
+    
+    # 2D slab with supercell
+    mpirun -n 4 gpaw python -- optimize_geometry.py slab.cif --fix-c --kpts 6 6 1 --supercell 2 2 1
 """
 
 import argparse
 import os
+import sys
+import time
 import numpy as np
 
 from ase import io
@@ -29,6 +41,72 @@ from ase.constraints import ExpCellFilter  # More stable than UnitCellFilter
 from ase.parallel import parprint, world
 
 from gpaw import GPAW, PW, FermiDirac
+
+# Try to import tqdm for progress bar
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+
+class ProgressCallback:
+    """Progress tracker for ASE optimizers with optional tqdm bar."""
+    
+    def __init__(self, atoms, max_steps, fmax_target, label="Optimizing", use_bar=True):
+        self.atoms = atoms
+        self.max_steps = max_steps
+        self.fmax_target = fmax_target
+        self.label = label
+        self.step = 0
+        self.start_time = time.time()
+        self.use_bar = use_bar and HAS_TQDM and world.rank == 0
+        
+        if self.use_bar:
+            self.pbar = tqdm(
+                total=max_steps,
+                desc=label,
+                unit="step",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                file=sys.stdout
+            )
+        else:
+            self.pbar = None
+    
+    def __call__(self):
+        """Called after each optimization step."""
+        self.step += 1
+        
+        # Get current forces
+        forces = self.atoms.get_forces()
+        fmax = np.sqrt((forces ** 2).sum(axis=1)).max()
+        energy = self.atoms.get_potential_energy()
+        
+        elapsed = time.time() - self.start_time
+        
+        if self.use_bar and self.pbar is not None:
+            self.pbar.update(1)
+            self.pbar.set_postfix({
+                'fmax': f'{fmax:.4f}',
+                'E': f'{energy:.3f}',
+                'target': f'{self.fmax_target}'
+            })
+        elif world.rank == 0:
+            # Simple text progress for non-tqdm
+            pct = 100 * self.step / self.max_steps
+            bar_len = 30
+            filled = int(bar_len * self.step / self.max_steps)
+            bar = '█' * filled + '░' * (bar_len - filled)
+            print(f"\r{self.label}: [{bar}] {self.step}/{self.max_steps} "
+                  f"fmax={fmax:.4f} E={energy:.3f} eV ({elapsed:.0f}s)", 
+                  end='', flush=True)
+    
+    def close(self):
+        """Clean up progress bar."""
+        if self.use_bar and self.pbar is not None:
+            self.pbar.close()
+        elif world.rank == 0:
+            print()  # New line after text progress
 
 
 def get_min_distance(atoms):
@@ -87,6 +165,15 @@ def main():
                         help="Fix c parameter (for 2D/slab with vacuum along c)")
     parser.add_argument("--two-stage", action="store_true",
                         help="Two-stage: first positions only, then cell+positions")
+    parser.add_argument("--supercell", type=int, nargs=3, default=None,
+                        metavar=("NX", "NY", "NZ"),
+                        help="Create supercell before optimization (e.g., 2 2 1)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print structure info only, don't run calculation")
+    parser.add_argument("--fast", action="store_true",
+                        help="Fast mode: coarse pre-optimization then refine (recommended for good initial geometries)")
+    parser.add_argument("--symmetry", action="store_true",
+                        help="Use symmetry to reduce k-points (faster, but incompatible with cell optimization)")
     args = parser.parse_args()
 
     cif_file = args.cif_file
@@ -105,6 +192,19 @@ def main():
     # Read structure
     parprint(f"Reading structure from {cif_file}...")
     atoms = io.read(cif_file, format="cif")
+
+    # Create supercell if requested
+    if args.supercell is not None:
+        sc = tuple(args.supercell)
+        n_orig = len(atoms)
+        atoms = atoms * sc
+        parprint(f"Created {sc[0]}×{sc[1]}×{sc[2]} supercell: {n_orig} → {len(atoms)} atoms")
+        # Update base name to include supercell info
+        base_name = f"{base_name}_{sc[0]}x{sc[1]}x{sc[2]}"
+        output_cif = f"{base_name}_optimized.cif"
+        output_xyz = f"{base_name}_optimized.xyz"
+        gpaw_log = f"{base_name}_gpaw.log"
+        traj_file = f"{base_name}_optimization.traj"
 
     # Check for bad geometry (too short distances)
     dmin = get_min_distance(atoms)
@@ -130,6 +230,19 @@ def main():
     parprint(f"  smearing: {args.smearing} eV")
     parprint(f"  fmax: {args.fmax} eV/Å")
     parprint(f"  max steps: {args.steps}")
+    if args.fix_c:
+        parprint(f"  mode: fix-c (2D/slab)")
+    if args.two_stage:
+        parprint(f"  two-stage: yes")
+
+    # Dry run - just print info and exit
+    if args.dry_run:
+        parprint(f"\n[DRY RUN] Would save to:")
+        parprint(f"  {output_cif}")
+        parprint(f"  {output_xyz}")
+        parprint(f"  {gpaw_log}")
+        parprint(f"\nExiting (dry run mode).")
+        return
 
     # Set up parallelization
     parallel_opts = pick_kpt_parallel(world.size, kpts)
@@ -138,7 +251,67 @@ def main():
         parprint(f"  Ranks: {world.size}")
         parprint(f"  Parallel options: {parallel_opts}")
 
-    # Create calculator
+    # Symmetry setting
+    use_symmetry = "off" if not args.symmetry else {"point_group": True, "time_reversal": True}
+    if args.symmetry:
+        parprint(f"\nUsing symmetry to reduce k-points (faster)")
+        if not args.fix_c:
+            parprint(f"  WARNING: Symmetry may break during cell optimization!")
+
+    # =========================================================
+    # FAST MODE: Coarse pre-optimization then refine
+    # =========================================================
+    if args.fast:
+        parprint("\n" + "="*50)
+        parprint("FAST MODE: Coarse → Fine optimization")
+        parprint("="*50)
+        
+        # Stage 1: Coarse optimization (fast)
+        coarse_ecut = min(300, args.ecut)
+        coarse_kpts = tuple(max(1, k//2) for k in kpts)  # Halve k-points
+        coarse_kpts = tuple(max(k, 1) for k in coarse_kpts)  # Ensure at least 1
+        
+        parprint(f"\n[Stage 1/2] COARSE pre-optimization:")
+        parprint(f"  ecut: {coarse_ecut} eV (vs final {args.ecut} eV)")
+        parprint(f"  kpts: {coarse_kpts} (vs final {kpts})")
+        parprint(f"  convergence: 1e-3 (loose)")
+        parprint(f"  target fmax: 0.1 eV/Å")
+        
+        coarse_parallel = pick_kpt_parallel(world.size, coarse_kpts)
+        coarse_calc = GPAW(
+            mode=PW(coarse_ecut),
+            xc="PBE",
+            occupations=FermiDirac(args.smearing),
+            kpts=coarse_kpts,
+            txt=f"{base_name}_coarse.log",
+            convergence={"energy": 1e-3, "density": 1e-3},
+            symmetry=use_symmetry,
+            parallel=coarse_parallel
+        )
+        atoms.calc = coarse_calc
+        
+        # Quick position-only relaxation
+        parprint("\n  Running coarse FIRE optimization...")
+        coarse_opt = FIRE(atoms, logfile=None)
+        coarse_progress = ProgressCallback(atoms, 30, 0.1, label="Coarse FIRE")
+        coarse_opt.attach(coarse_progress)
+        coarse_opt.run(fmax=0.1, steps=30)
+        coarse_progress.close()
+        
+        e_coarse = atoms.get_potential_energy()
+        f_coarse = np.sqrt((atoms.get_forces() ** 2).sum(axis=1)).max()
+        parprint(f"\n  Coarse done: E={e_coarse:.4f} eV, fmax={f_coarse:.4f} eV/Å")
+        
+        # Clear calculator for fine stage
+        atoms.calc = None
+        
+        parprint(f"\n[Stage 2/2] FINE optimization:")
+        parprint(f"  ecut: {args.ecut} eV")
+        parprint(f"  kpts: {kpts}")
+    
+    # =========================================================
+    # Create main calculator (or fine-stage calculator in fast mode)
+    # =========================================================
     calc = GPAW(
         mode=PW(args.ecut),
         xc="PBE",
@@ -146,28 +319,23 @@ def main():
         kpts=kpts,
         txt=gpaw_log,
         convergence={"energy": 1e-4, "density": 1e-4},
-        symmetry="off",  # Required for cell optimization
+        symmetry="off",  # Must be off for cell optimization
         parallel=parallel_opts
     )
     atoms.calc = calc
 
-    # Initial energy
-    parprint("\nCalculating initial energy...")
-    e0 = atoms.get_potential_energy()
-    f0 = atoms.get_forces()
-    fmax0 = np.sqrt((f0 ** 2).sum(axis=1)).max()
-    parprint(f"  Initial energy: {e0:.6f} eV")
-    parprint(f"  Initial max force: {fmax0:.4f} eV/Å")
-
-    if fmax0 > 1.0:
-        parprint(f"  WARNING: Large initial forces! Structure may be far from minimum.")
-        parprint(f"           Consider --two-stage or pre-relaxation with lower ecut/kpts.")
+    # Skip initial energy calculation - optimizer computes on first step
+    # This saves one full SCF cycle (~30s-2min depending on system size)
+    parprint("\nStarting optimization (initial energy computed on first step)...")
 
     # Two-stage optimization
     if args.two_stage:
         parprint("\n=== Stage 1: Position relaxation (cell fixed) ===")
-        opt1 = LBFGS(atoms, trajectory=f"{base_name}_stage1.traj", logfile='-')
+        opt1 = LBFGS(atoms, trajectory=f"{base_name}_stage1.traj", logfile=None)
+        stage1_progress = ProgressCallback(atoms, 50, 0.1, label="Position relax")
+        opt1.attach(stage1_progress)
         opt1.run(fmax=0.1, steps=50)
+        stage1_progress.close()
         parprint(f"  Stage 1 complete. Energy: {atoms.get_potential_energy():.6f} eV")
 
     # Main optimization (cell + positions)
@@ -189,15 +357,21 @@ def main():
 
     # Stage 1: FIRE pre-relax (robust for rough geometries)
     parprint("\n  [1/2] FIRE pre-relax (fmax=0.1)...")
-    fire_opt = FIRE(ecf, trajectory=f"{base_name}_fire.traj", logfile='-')  # '-' = print to terminal
+    fire_opt = FIRE(ecf, trajectory=f"{base_name}_fire.traj", logfile=None)
+    fire_progress = ProgressCallback(atoms, 50, 0.1, label="FIRE pre-relax")
+    fire_opt.attach(fire_progress)
     fire_opt.run(fmax=0.1, steps=50)
+    fire_progress.close()
     f_after_fire = np.sqrt((atoms.get_forces() ** 2).sum(axis=1)).max()
     parprint(f"        FIRE done. fmax={f_after_fire:.4f} eV/Å")
 
     # Stage 2: LBFGS finish (fast convergence near minimum)
     parprint(f"\n  [2/2] LBFGS finish (fmax={args.fmax})...")
-    lbfgs_opt = LBFGS(ecf, trajectory=traj_file, logfile='-')  # '-' = print to terminal
+    lbfgs_opt = LBFGS(ecf, trajectory=traj_file, logfile=None)
+    lbfgs_progress = ProgressCallback(atoms, args.steps, args.fmax, label="LBFGS finish")
+    lbfgs_opt.attach(lbfgs_progress)
     lbfgs_opt.run(fmax=args.fmax, steps=args.steps)
+    lbfgs_progress.close()
 
     # Final results
     e1 = atoms.get_potential_energy()
@@ -207,9 +381,7 @@ def main():
     parprint(f"\n{'='*50}")
     parprint("OPTIMIZATION COMPLETE")
     parprint(f"{'='*50}")
-    parprint(f"  Initial energy: {e0:.6f} eV")
     parprint(f"  Final energy:   {e1:.6f} eV")
-    parprint(f"  Energy change:  {e1 - e0:.6f} eV")
     parprint(f"  Final max force: {fmax1:.6f} eV/Å")
 
     parprint(f"\nFinal structure:")
