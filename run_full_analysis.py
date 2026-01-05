@@ -332,58 +332,63 @@ def main():
     
     fermi = calc.get_fermi_level()
     
-    # Use GPAW's built-in DOS calculation (compatible with GPAW 25.x)
-    # Create energy grid around Fermi level
-    e_min = fermi - 10.0
-    e_max = fermi + 10.0
+    # Collect all eigenvalues from all k-points and spins
+    parprint("  Extracting eigenvalues from all k-points...")
+    eigenvalues = []
+    kpt_weights = []
+    
+    n_kpts = len(calc.get_ibz_k_points())
+    n_spins = calc.get_number_of_spins()
+    weights = calc.get_k_point_weights()
+    
+    for k in range(n_kpts):
+        for s in range(n_spins):
+            try:
+                eigs = calc.get_eigenvalues(kpt=k, spin=s)
+                w = weights[k]
+                for eig in eigs:
+                    eigenvalues.append(eig)
+                    kpt_weights.append(w)
+            except Exception as e:
+                parprint(f"  Warning: Could not get eigenvalues for k={k}, s={s}: {e}")
+    
+    eigenvalues = np.array(eigenvalues)
+    kpt_weights = np.array(kpt_weights)
+    
+    parprint(f"  Found {len(eigenvalues)} eigenvalues from {n_kpts} k-points")
+    parprint(f"  Eigenvalue range: [{eigenvalues.min():.2f}, {eigenvalues.max():.2f}] eV")
+    
+    # Create energy grid
+    e_min = eigenvalues.min() - 2.0
+    e_max = eigenvalues.max() + 2.0
     npts = 1001
     energies = np.linspace(e_min, e_max, npts)
     
-    # Get eigenvalues and compute DOS with Gaussian broadening
-    from gpaw.dos import DOSCalculator
-    dos_calc = DOSCalculator.from_calculator(calc)
+    # Compute DOS with Gaussian broadening (weighted by k-point weights)
+    dos = np.zeros_like(energies)
+    for eig, w in zip(eigenvalues, kpt_weights):
+        dos += w * np.exp(-((energies - eig) / dos_width)**2 / 2)
+    dos /= (dos_width * np.sqrt(2 * np.pi))
     
-    # Use raw_dos method or calculate from eigenvalues
-    try:
-        # Try newer API
-        dos = dos_calc.raw_dos(energies, width=dos_width)[0]
-    except (AttributeError, TypeError):
-        # Fallback: compute DOS from eigenvalues manually
-        parprint("  Using eigenvalue-based DOS calculation...")
-        eigenvalues = []
-        weights = []
-        for kpt in calc.get_ibz_k_points():
-            for spin in range(calc.get_number_of_spins()):
-                try:
-                    eigs = calc.get_eigenvalues(kpt=0, spin=spin)
-                    eigenvalues.extend(eigs)
-                    weights.extend([1.0] * len(eigs))
-                except:
-                    pass
-        
-        if eigenvalues:
-            eigenvalues = np.array(eigenvalues)
-            # Gaussian broadening
-            dos = np.zeros_like(energies)
-            for eig in eigenvalues:
-                dos += np.exp(-((energies - eig) / dos_width)**2 / 2)
-            dos /= (dos_width * np.sqrt(2 * np.pi))
-        else:
-            parprint("  Warning: Could not extract eigenvalues for DOS")
-            dos = np.zeros_like(energies)
+    # Find band edges from eigenvalues directly (more reliable)
+    # VBM: highest occupied state (below or at Fermi level)
+    # CBM: lowest unoccupied state (above Fermi level)
+    occupied = eigenvalues[eigenvalues <= fermi + 0.01]  # Small tolerance
+    unoccupied = eigenvalues[eigenvalues > fermi + 0.01]
     
-    # Find band edges
-    dos_threshold = dos.max() * 0.001
-    gap_region = dos < dos_threshold
-    below_fermi = energies < fermi
-    above_fermi = energies > fermi
+    if len(occupied) > 0:
+        vbm = occupied.max()
+    else:
+        vbm = fermi
     
-    has_dos_below = ~gap_region & below_fermi
-    has_dos_above = ~gap_region & above_fermi
+    if len(unoccupied) > 0:
+        cbm = unoccupied.min()
+    else:
+        cbm = fermi
     
-    vbm = energies[has_dos_below].max() if has_dos_below.any() else fermi
-    cbm = energies[has_dos_above].min() if has_dos_above.any() else fermi
     band_gap = cbm - vbm if cbm > vbm else 0.0
+    
+    parprint(f"  VBM: {vbm:.4f} eV, CBM: {cbm:.4f} eV, Gap: {band_gap:.4f} eV")
     
     parprint(f"\nElectronic structure:")
     parprint(f"  Fermi level: {fermi:.4f} eV")

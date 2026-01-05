@@ -107,89 +107,57 @@ def calculate_dos(atoms, calc, npts=2001, width=0.1):
         - cbm: conduction band minimum
         - band_gap: band gap
     """
-    from gpaw.dos import DOSCalculator
-    
     # Get Fermi level
     fermi = calc.get_fermi_level()
     
-    # Create energy grid around Fermi level
-    e_min = fermi - 10.0
-    e_max = fermi + 10.0
+    # Collect all eigenvalues from all k-points and spins
+    eigenvalues = []
+    kpt_weights_list = []
+    
+    n_kpts = len(calc.get_ibz_k_points())
+    n_spins = calc.get_number_of_spins()
+    weights = calc.get_k_point_weights()
+    
+    for k in range(n_kpts):
+        for s in range(n_spins):
+            try:
+                eigs = calc.get_eigenvalues(kpt=k, spin=s)
+                w = weights[k]
+                for eig in eigs:
+                    eigenvalues.append(eig)
+                    kpt_weights_list.append(w)
+            except:
+                pass
+    
+    eigenvalues = np.array(eigenvalues)
+    kpt_weights_list = np.array(kpt_weights_list)
+    
+    # Create energy grid
+    e_min = eigenvalues.min() - 2.0
+    e_max = eigenvalues.max() + 2.0
     energies = np.linspace(e_min, e_max, npts)
     
-    # Calculate DOS (GPAW 25.x compatible)
-    dos_calc = DOSCalculator.from_calculator(calc)
+    # Compute DOS with Gaussian broadening
+    dos = np.zeros_like(energies)
+    for eig, w in zip(eigenvalues, kpt_weights_list):
+        dos += w * np.exp(-((energies - eig) / width)**2 / 2)
+    dos /= (width * np.sqrt(2 * np.pi))
     
-    try:
-        # Try raw_dos method
-        dos = dos_calc.raw_dos(energies, width=width)[0]
-    except (AttributeError, TypeError):
-        # Fallback: compute DOS from eigenvalues manually
-        parprint("  Using eigenvalue-based DOS calculation...")
-        eigenvalues = []
-        for spin in range(calc.get_number_of_spins()):
-            for k in range(len(calc.get_ibz_k_points())):
-                try:
-                    eigs = calc.get_eigenvalues(kpt=k, spin=spin)
-                    eigenvalues.extend(eigs)
-                except:
-                    pass
-        
-        if eigenvalues:
-            eigenvalues = np.array(eigenvalues)
-            # Gaussian broadening
-            dos = np.zeros_like(energies)
-            for eig in eigenvalues:
-                dos += np.exp(-((energies - eig) / width)**2 / 2)
-            dos /= (width * np.sqrt(2 * np.pi))
-        else:
-            dos = np.zeros_like(energies)
+    # Find band edges from eigenvalues directly (more reliable)
+    # VBM: highest occupied state (below or at Fermi level)
+    # CBM: lowest unoccupied state (above Fermi level)
+    occupied = eigenvalues[eigenvalues <= fermi + 0.01]
+    unoccupied = eigenvalues[eigenvalues > fermi + 0.01]
     
-    # Find band edges
-    # VBM: highest energy with significant DOS below Fermi level
-    # CBM: lowest energy with significant DOS above Fermi level
-    
-    dos_threshold = dos.max() * 0.001  # 0.1% of max DOS
-    
-    # Energies relative to Fermi level
-    e_rel = energies - fermi
-    
-    # Find VBM (highest occupied state)
-    occupied = (e_rel <= 0.05) & (dos > dos_threshold)  # Small tolerance
-    if occupied.any():
-        vbm_idx = np.where(occupied)[0][-1]
-        vbm = energies[vbm_idx]
+    if len(occupied) > 0:
+        vbm = occupied.max()
     else:
         vbm = fermi
     
-    # Find CBM (lowest unoccupied state)
-    unoccupied = (e_rel >= -0.05) & (dos > dos_threshold)
-    if unoccupied.any():
-        # Find first state above VBM with gap
-        for i in range(len(energies)):
-            if energies[i] > vbm + 0.1 and dos[i] > dos_threshold:
-                cbm = energies[i]
-                break
-        else:
-            cbm = energies[unoccupied][-1]  # Fallback
+    if len(unoccupied) > 0:
+        cbm = unoccupied.min()
     else:
         cbm = fermi
-    
-    # More robust band edge detection
-    # Find the gap region (where DOS is very small)
-    gap_region = dos < dos_threshold
-    
-    # VBM: last energy before gap starts (below Fermi)
-    below_fermi = energies < fermi
-    has_dos_below = ~gap_region & below_fermi
-    if has_dos_below.any():
-        vbm = energies[has_dos_below].max()
-    
-    # CBM: first energy after gap ends (above Fermi)
-    above_fermi = energies > fermi
-    has_dos_above = ~gap_region & above_fermi
-    if has_dos_above.any():
-        cbm = energies[has_dos_above].min()
     
     # Calculate band gap
     band_gap = cbm - vbm if cbm > vbm else 0.0
