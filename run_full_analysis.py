@@ -28,10 +28,11 @@ Quality presets:
     - standard:   Normal workflow (default)
     - production: Publication quality
 
-Output:
-    - {name}_summary.json     : All properties in one file
-    - {name}_dos.png          : DOS plot
-    - {name}_report.txt       : Human-readable report
+Output (in {name}/ folder):
+    - {name}_{quality}_summary.json  : All properties in one file
+    - {name}_{quality}_dos.png       : DOS plot
+    - {name}_{quality}_dos.csv       : DOS data table
+    - {name}_{quality}_report.txt    : Human-readable report
 """
 
 import argparse
@@ -251,6 +252,18 @@ def main():
     atoms = io.read(args.cif_file)
     base_name = os.path.splitext(os.path.basename(args.cif_file))[0]
     
+    # Create output directory (don't delete if exists)
+    output_dir = base_name
+    if world.rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+    world.barrier()  # Wait for directory creation
+    
+    # Quality suffix for output files
+    quality_suffix = f"_{args.quality}"
+    output_base = os.path.join(output_dir, f"{base_name}{quality_suffix}")
+    
+    parprint(f"Output directory: {output_dir}/")
+    
     # Detect system type and get preset
     system_type = detect_system_type(atoms)
     preset = get_preset(args.quality, system_type)
@@ -318,7 +331,7 @@ def main():
         xc='PBE',
         occupations=FermiDirac(smearing),
         kpts=kpts_dos,
-        txt=f"{base_name}_analysis.log",
+        txt=f"{output_base}_analysis.log",
         convergence=convergence
     )
     atoms.calc = calc
@@ -435,7 +448,27 @@ def main():
     except Exception as e:
         parprint(f"  Warning: Could not calculate vacuum level: {e}")
     
+    # Save DOS table (CSV)
+    dos_csv_file = f"{output_base}_dos.csv"
+    try:
+        # Only rank 0 writes files
+        if world.rank == 0:
+            with open(dos_csv_file, 'w') as f:
+                f.write("# DOS data for {}\n".format(atoms.get_chemical_formula()))
+                f.write("# Quality: {}\n".format(args.quality))
+                f.write("# Fermi level: {:.6f} eV\n".format(fermi))
+                f.write("# VBM: {:.6f} eV\n".format(vbm))
+                f.write("# CBM: {:.6f} eV\n".format(cbm))
+                f.write("# Band gap: {:.6f} eV\n".format(band_gap))
+                f.write("Energy_eV,DOS_states_per_eV\n")
+                for e, d in zip(energies, dos):
+                    f.write(f"{e:.6f},{d:.6f}\n")
+        parprint(f"\nSaved: {dos_csv_file}")
+    except Exception as e:
+        parprint(f"Warning: Could not save DOS table: {e}")
+    
     # Save DOS plot
+    dos_png_file = f"{output_base}_dos.png"
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -451,14 +484,14 @@ def main():
             ax.axvspan(vbm, cbm, alpha=0.15, color='yellow', label=f'Gap = {band_gap:.2f} eV')
         ax.set_xlabel('Energy (eV)')
         ax.set_ylabel('DOS (states/eV)')
-        ax.set_title(f"DOS: {atoms.get_chemical_formula()} (E_g = {band_gap:.2f} eV)")
+        ax.set_title(f"DOS: {atoms.get_chemical_formula()} [{args.quality}] (E_g = {band_gap:.2f} eV)")
         ax.legend()
         ax.set_xlim(fermi - 8, fermi + 8)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(f"{base_name}_dos.png", dpi=150)
+        plt.savefig(dos_png_file, dpi=150)
         plt.close()
-        parprint(f"\nSaved: {base_name}_dos.png")
+        parprint(f"Saved: {dos_png_file}")
     except Exception as e:
         parprint(f"Warning: Could not create DOS plot: {e}")
     
@@ -478,7 +511,7 @@ def main():
             xc='PBE',
             occupations=FermiDirac(smearing),
             kpts=kpts_dos,
-            txt=f"{base_name}_pristine.log",
+            txt=f"{output_base}_pristine.log",
             convergence=convergence
         )
         pristine_atoms.calc = pristine_calc
@@ -531,7 +564,7 @@ def main():
             xc='PBE',
             occupations=FermiDirac(smearing),
             kpts=kpts_scf,
-            txt=f"{base_name}_with_H.log",
+            txt=f"{output_base}_with_H.log",
             convergence=convergence
         )
         atoms_H.calc = calc_H
@@ -568,7 +601,7 @@ def main():
             'E_surface_H_eV': float(E_surf_H)
         }
         
-        io.write(f"{base_name}_with_H_opt.cif", atoms_H)
+        io.write(f"{output_base}_with_H_opt.cif", atoms_H)
     
     # =========================================================
     # Step 4: Charge Analysis
@@ -623,14 +656,16 @@ def main():
     parprint(f"{'='*70}")
     
     # Save summary JSON
-    summary_file = f"{base_name}_summary.json"
-    with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+    summary_file = f"{output_base}_summary.json"
+    if world.rank == 0:
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
     parprint(f"Saved: {summary_file}")
     
     # Generate report
-    report_file = f"{base_name}_report.txt"
-    generate_report(summary, report_file)
+    report_file = f"{output_base}_report.txt"
+    if world.rank == 0:
+        generate_report(summary, report_file)
     
     parprint(f"\n{'='*70}")
     parprint("ANALYSIS COMPLETE")
@@ -640,10 +675,12 @@ def main():
         parprint(f"\n{quality_warning}")
     
     parprint(f"\nQuality: {args.quality} ({preset['uncertainty']})")
-    parprint(f"\nOutput files:")
+    parprint(f"\nOutput directory: {output_dir}/")
+    parprint(f"Output files:")
     parprint(f"  - {summary_file}")
     parprint(f"  - {report_file}")
-    parprint(f"  - {base_name}_dos.png")
+    parprint(f"  - {output_base}_dos.png")
+    parprint(f"  - {output_base}_dos.csv")
     
     if args.quality == 'draft':
         parprint(f"\n>>> Re-run with --quality standard for publication values")
