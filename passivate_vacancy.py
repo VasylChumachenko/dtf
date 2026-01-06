@@ -317,9 +317,12 @@ def add_functional_groups(atoms, sites, assignments):
         
     Returns:
         Modified atoms object, list of added atom indices
+    
+    Note: Atoms are placed at exact positions without wrapping.
+          GPAW and other DFT codes handle PBC correctly.
+          Use XYZ format for visualization to see exact positions.
     """
     added_atoms = []
-    atoms_to_append = []
     
     for site_idx, group_type in assignments.items():
         site = sites[site_idx]
@@ -331,20 +334,21 @@ def add_functional_groups(atoms, sites, assignments):
         group_atoms = get_group_atoms(group_type, pass_vector)
         
         # Add atoms relative to the undercoordinated site
-        base_pos = site['position']
+        anchor_idx = site['index']
+        base_pos = atoms.positions[anchor_idx].copy()
+        
         for symbol, rel_pos in group_atoms:
             abs_pos = base_pos + rel_pos
-            atoms_to_append.append(Atom(symbol, abs_pos))
+            atoms.append(Atom(symbol, abs_pos))
             added_atoms.append({
                 'symbol': symbol,
-                'position': abs_pos,
+                'position': abs_pos.copy(),
                 'group': group_type,
-                'attached_to': site['index']
+                'attached_to': anchor_idx
             })
     
-    # Append all new atoms
-    for atom in atoms_to_append:
-        atoms.append(atom)
+    # DO NOT wrap - GPAW handles PBC correctly
+    # Wrapping breaks bonds by moving atoms independently
     
     return atoms, added_atoms
 
@@ -437,9 +441,26 @@ def main():
         group_str = "_".join(groups_used)
         output_file = f"{base}_passivated_{group_str}.cif"
     
-    # Save
+    # Safety check: never overwrite the input file
+    input_abs = os.path.abspath(args.structure)
+    output_abs = os.path.abspath(output_file)
+    if input_abs == output_abs:
+        print(f"\nERROR: Output file would overwrite input file!")
+        print(f"       Please use -o to specify a different output name.")
+        sys.exit(1)
+    
+    # Save in multiple formats
+    # XYZ preserves exact atomic positions
+    # CIF wraps atoms into unit cell (may look different in VESTA but DFT is correct)
+    
+    xyz_file = output_file.replace('.cif', '.xyz')
+    io.write(xyz_file, atoms)
     io.write(output_file, atoms)
-    print(f"\nSaved: {output_file}")
+    
+    print(f"\nSaved: {xyz_file} (exact positions - use for visualization)")
+    print(f"       {output_file} (for DFT - positions may look wrapped)")
+    print("\n⚠️  NOTE: CIF format wraps atoms into unit cell.")
+    print("   For correct visualization, open the .xyz file in VESTA/Avogadro.")
     print(f"New formula: {atoms.get_chemical_formula()}")
     print(f"Total atoms: {len(atoms)}")
     
