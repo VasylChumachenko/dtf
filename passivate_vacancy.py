@@ -22,6 +22,7 @@ After passivation, run geometry optimization:
 """
 
 import argparse
+import os
 import sys
 import numpy as np
 from ase import Atoms, Atom
@@ -77,8 +78,19 @@ def get_group_atoms(group_type, bond_vector):
     atoms_to_add = []
     
     if group_type == 'H':
-        # Simple hydrogen
+        # Simple hydrogen - place out of plane to avoid overlap
+        # For 2D materials, H atoms point above/below the plane
         pos = bond_vector * BOND_LENGTHS['C-H']
+        atoms_to_add.append(('H', pos))
+        
+    elif group_type == 'H_UP':
+        # Hydrogen pointing up (+z) for 2D materials
+        pos = np.array([0, 0, BOND_LENGTHS['C-H']])
+        atoms_to_add.append(('H', pos))
+        
+    elif group_type == 'H_DOWN':
+        # Hydrogen pointing down (-z) for 2D materials
+        pos = np.array([0, 0, -BOND_LENGTHS['C-H']])
         atoms_to_add.append(('H', pos))
         
     elif group_type == 'OH':
@@ -184,35 +196,47 @@ def calculate_passivation_vector(atoms, site_info):
     Returns:
         Unit vector pointing toward passivation direction
     """
+    center_idx = site_info['index']
     center = site_info['position']
     neighbor_indices = site_info['neighbors']
     
     if len(neighbor_indices) == 0:
-        # No neighbors - point along z
+        # No neighbors - point along z (out of plane)
         return np.array([0, 0, 1])
     
-    # Calculate vectors to all neighbors
+    # Calculate vectors to all neighbors using proper minimum image convention
+    # This works correctly for hexagonal and any other cell geometry
     neighbor_vectors = []
     for ni in neighbor_indices:
-        vec = atoms.positions[ni] - center
-        # Handle PBC
-        vec = vec - np.round(vec / atoms.cell.lengths()) * atoms.cell.lengths()
-        neighbor_vectors.append(vec / np.linalg.norm(vec))
+        # Use ASE's get_distance with vector=True for correct MIC handling
+        # This returns the vector from center to neighbor with PBC
+        vec = atoms.get_distance(center_idx, ni, mic=True, vector=True)
+        if np.linalg.norm(vec) > 0.1:  # Avoid zero vectors
+            neighbor_vectors.append(vec / np.linalg.norm(vec))
+    
+    if len(neighbor_vectors) == 0:
+        return np.array([0, 0, 1])
     
     # Passivation vector is opposite to average neighbor direction
     avg_neighbor = np.mean(neighbor_vectors, axis=0)
     
     if np.linalg.norm(avg_neighbor) < 0.1:
         # Neighbors are symmetric - use cross product to find perpendicular
+        # For sp2 carbon in plane, point out of plane
         if len(neighbor_vectors) >= 2:
             passivation = np.cross(neighbor_vectors[0], neighbor_vectors[1])
+            if np.linalg.norm(passivation) < 0.1:
+                passivation = np.array([0, 0, 1])
         else:
             passivation = np.array([0, 0, 1])
     else:
         passivation = -avg_neighbor
     
     # Normalize
-    passivation = passivation / np.linalg.norm(passivation)
+    norm = np.linalg.norm(passivation)
+    if norm < 0.1:
+        return np.array([0, 0, 1])
+    passivation = passivation / norm
     
     return passivation
 
@@ -267,7 +291,7 @@ def interactive_menu(sites, atoms):
     print("  all  - Apply same group to all remaining sites")
     print()
     
-    valid_groups = ['H', 'OH', 'NH2', 'O', 'CN', 'skip']
+    valid_groups = ['H', 'H_UP', 'H_DOWN', 'OH', 'NH2', 'O', 'CN', 'skip']
     apply_all = None
     
     for i, site in enumerate(sites):
@@ -434,7 +458,6 @@ def main():
     if args.output:
         output_file = args.output
     else:
-        import os
         base = os.path.splitext(args.structure)[0]
         # Add group info to filename
         groups_used = sorted(set(assignments.values()))
