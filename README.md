@@ -4,12 +4,14 @@ A Python project for Density Functional Theory (DFT) calculations using GPAW, fo
 
 ## Features
 
-- **Geometry optimization** with GPAW (PW mode)
+- **Geometry optimization** with GPAW (PW or LCAO mode)
 - **DOS calculation** → Band gap, VBM, CBM
 - **Vacuum alignment** → Band positions vs vacuum level
 - **ΔG_H* calculation** → HER activity descriptor
 - **Formation energy** → Defect stability
 - **Charge analysis** → Hirshfeld/Bader charges
+- **Defect creation** → N-vacancies (bridging/central)
+- **Vacancy passivation** → Functional groups (-H, -OH, -NH₂, =O, -CN)
 - **Quality presets** → draft/standard/production modes for speed vs accuracy tradeoff
 
 ## Setup
@@ -28,14 +30,15 @@ pip install -r requirements.txt
 ## Workflow Overview
 
 ```
-1. Build structure     → build_g_c3n4.py
-2. Create defect       → create_vacancy.py
-3. Optimize geometry   → optimize_geometry.py
-4. Calculate properties → calculate_properties.py
-5. H adsorption        → calculate_h_adsorption.py
-6. Charge analysis     → calculate_charges.py
+1. Build structure      → build_g_c3n4.py
+2. Create defect        → create_vacancy.py
+3. Passivate (optional) → passivate_vacancy.py
+4. Optimize geometry    → optimize_geometry.py
+5. Calculate properties → calculate_properties.py
+6. H adsorption         → calculate_h_adsorption.py
+7. Charge analysis      → calculate_charges.py
    
-Or use: run_full_analysis.py (all-in-one)
+Or use: run_full_analysis.py (all-in-one after optimization)
 ```
 
 ## Quality Presets
@@ -75,22 +78,52 @@ python create_vacancy.py g_c3n4_monolayer.cif
 
 # Create bridging N vacancy in 2×2 supercell
 python create_vacancy.py g_c3n4_monolayer.cif --supercell 2 2 1 --type bridging
+
+# Create central N vacancy
+python create_vacancy.py g_c3n4_monolayer.cif --supercell 2 2 1 --type central
 ```
+
+### 2b. Passivate Vacancy (Optional)
+```bash
+# Auto-detect undercoordinated atoms and passivate with H
+python passivate_vacancy.py vacancy.cif --auto --group H
+
+# Passivate with other functional groups
+python passivate_vacancy.py vacancy.cif --auto --group OH   # hydroxyl
+python passivate_vacancy.py vacancy.cif --auto --group NH2  # amino
+python passivate_vacancy.py vacancy.cif --auto --group O    # oxo (=O)
+python passivate_vacancy.py vacancy.cif --auto --group CN   # cyano
+
+# Interactive mode (choose site-by-site)
+python passivate_vacancy.py vacancy.cif
+```
+
+Available functional groups: `-H`, `-OH`, `-NH₂`, `=O`, `-CN`
 
 ### 3. Geometry Optimization
 ```bash
-# Serial
+# Serial (PW mode - default, accurate)
 gpaw python optimize_geometry.py structure.cif --fix-c --kpts 4 4 1
 
-# Parallel (recommended)
+# Parallel with fast pre-optimization
 mpirun -n 4 gpaw python -- optimize_geometry.py structure.cif --fix-c --kpts 4 4 1 --fast
+
+# LCAO mode (much faster, good for initial screening)
+mpirun -n 4 gpaw python -- optimize_geometry.py structure.cif --lcao --fix-cell
+
+# FIRE-only optimization (robust for problematic structures)
+mpirun -n 4 gpaw python -- optimize_geometry.py structure.cif --lcao --fire-only --fix-cell
 ```
 
 Options:
-- `--fix-c` : Fix c-axis (for 2D materials with vacuum)
+- `--fix-c` : Fix c-axis only (for 2D materials with vacuum)
+- `--fix-cell` : Fix all cell parameters (recommended for defects)
 - `--fast` : Coarse pre-optimization then refine
+- `--lcao` : Use LCAO mode (faster, ~5-10× speedup)
+- `--basis dzp` : LCAO basis set (szp, dzp, tzp)
+- `--fire-only` : Use FIRE optimizer only (more robust for defects)
 - `--kpts 4 4 1` : k-point grid
-- `--ecut 500` : Plane-wave cutoff (eV)
+- `--ecut 500` : Plane-wave cutoff (eV, PW mode only)
 - `--fmax 0.03` : Force convergence (eV/Å)
 
 ### 4. DOS and Electronic Properties
@@ -183,23 +216,41 @@ mpirun -n 4 gpaw python -- run_full_analysis.py defect.cif \
 # 1. Create defect structure
 python create_vacancy.py g_c3n4_monolayer.cif --supercell 2 2 1 --type bridging
 
-# 2. Optimize defect geometry
-mpirun -n 4 gpaw python -- optimize_geometry.py \
-    g_c3n4_monolayer_2x2x1_Nvac_bridging.cif \
-    --fix-c --kpts 3 3 1 --fast
+# 2. Passivate dangling bonds (optional but recommended)
+python passivate_vacancy.py g_c3n4_monolayer_2x2x1_Nvac_bridging.cif --auto --group H
 
-# 3. Also optimize pristine supercell (for formation energy)
-mpirun -n 4 gpaw python -- optimize_geometry.py \
+# 3. Optimize defect geometry (LCAO for speed, fix cell for stability)
+mpirun -n 8 gpaw python -- optimize_geometry.py \
+    g_c3n4_monolayer_2x2x1_Nvac_bridging_passivated_H.cif \
+    --lcao --fix-cell --quality draft
+
+# 4. Also optimize pristine supercell (for formation energy)
+mpirun -n 8 gpaw python -- optimize_geometry.py \
     g_c3n4_monolayer.cif --supercell 2 2 1 \
-    --fix-c --kpts 3 3 1 --fast
+    --lcao --fix-cell --quality draft
 
-# 4. Run full analysis
-mpirun -n 4 gpaw python -- run_full_analysis.py \
-    g_c3n4_monolayer_2x2x1_Nvac_bridging_optimized.cif \
-    --pristine g_c3n4_monolayer_2x2x1_optimized.cif \
+# 5. Run full analysis
+mpirun -n 8 gpaw python -- run_full_analysis.py \
+    g_c3n4_monolayer_2x2x1_Nvac_bridging_passivated_H/..._draft_optimized.cif \
+    --pristine g_c3n4_monolayer_2x2x1/..._draft_optimized.cif \
     --h-site 15 \
-    --kpts 6 6 1
+    --quality draft
 ```
+
+### Fast Screening Workflow (Draft Quality)
+
+For initial MVD (Minimal Viable Dataset) screening:
+
+```bash
+# Quick geometry optimization with LCAO
+mpirun -n 8 gpaw python -- optimize_geometry.py structure.cif \
+    --lcao --fix-cell --quality draft --fire-only
+
+# Quick property analysis
+mpirun -n 8 gpaw python -- run_full_analysis.py optimized.cif --quality draft
+```
+
+Draft mode provides ~5× speedup with clearly labeled uncertainty estimates.
 
 ## Output Files Summary
 
