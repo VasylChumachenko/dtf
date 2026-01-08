@@ -19,6 +19,8 @@ Options:
     --gpu        Enable GPU acceleration (LCAO only, requires CuPy)
     --two-stage  First relax positions, then cell+positions
     --fire-only  Use FIRE only (robust for defects, H atoms, oscillating systems)
+    --spinpol    Enable spin-polarized calculation (for radicals, vacancies, magnetic systems)
+    --magmom     Initial magnetic moment per atom (default: 0.5 on undercoordinated C/N)
     --supercell  Create supercell before optimization (e.g., 2 2 1)
     --dry-run    Print structure info only, don't run calculation
     --symmetry   Use symmetry to reduce k-points (faster, but not for cell optimization)
@@ -160,6 +162,87 @@ def get_min_distance(atoms):
     return dmin
 
 
+def find_undercoordinated_atoms(atoms, cutoff=1.8):
+    """
+    Find atoms with fewer bonds than expected.
+    Useful for detecting vacancy sites with dangling bonds.
+    
+    Expected coordination:
+    - C in g-C3N4: 3 (sp2)
+    - N in g-C3N4: 2 or 3 (bridging or corner)
+    - H: 1
+    
+    Returns dict: {atom_index: (symbol, coordination, expected)}
+    """
+    from ase.neighborlist import neighbor_list
+    
+    # Expected coordination numbers
+    expected_coord = {'C': 3, 'N': 2, 'H': 1, 'O': 2}  # N can be 2 or 3
+    
+    # Get neighbor list
+    i_list, j_list = neighbor_list('ij', atoms, cutoff=cutoff)
+    
+    # Count coordination
+    symbols = atoms.get_chemical_symbols()
+    coordination = {i: 0 for i in range(len(atoms))}
+    for i in i_list:
+        coordination[i] += 1
+    
+    # Find undercoordinated atoms
+    undercoord = {}
+    for idx, symbol in enumerate(symbols):
+        coord = coordination[idx]
+        expected = expected_coord.get(symbol, 4)
+        
+        # C is undercoordinated if < 3 bonds
+        # N can be 2 or 3, so undercoordinated if < 2
+        if symbol == 'C' and coord < 3:
+            undercoord[idx] = (symbol, coord, 3)
+        elif symbol == 'N' and coord < 2:
+            undercoord[idx] = (symbol, coord, 2)
+    
+    return undercoord
+
+
+def setup_magnetic_moments(atoms, magmom_value=0.5):
+    """
+    Set initial magnetic moments for spin-polarized calculation.
+    Automatically detects undercoordinated atoms (vacancy sites).
+    
+    Returns list of magnetic moments and list of modified atom indices.
+    """
+    undercoord = find_undercoordinated_atoms(atoms)
+    
+    # Initialize all moments to 0
+    magmoms = [0.0] * len(atoms)
+    modified_indices = []
+    
+    if undercoord:
+        # Set magnetic moment on undercoordinated atoms
+        for idx, (symbol, coord, expected) in undercoord.items():
+            magmoms[idx] = magmom_value
+            modified_indices.append(idx)
+    else:
+        # No undercoordinated atoms found
+        # For vacancies, try to find C atoms with only 2 neighbors
+        # This catches cases where the cutoff might miss some bonds
+        symbols = atoms.get_chemical_symbols()
+        for idx, symbol in enumerate(symbols):
+            if symbol == 'C':
+                # Check coordination more carefully
+                neighbors = 0
+                for j in range(len(atoms)):
+                    if j != idx:
+                        d = atoms.get_distance(idx, j, mic=True)
+                        if d < 1.8:
+                            neighbors += 1
+                if neighbors < 3:
+                    magmoms[idx] = magmom_value
+                    modified_indices.append(idx)
+    
+    return magmoms, modified_indices
+
+
 def pick_kpt_parallel(world_size: int, kpts) -> dict:
     """
     Choose safe k-point parallelization.
@@ -221,6 +304,10 @@ def main():
                         help="Two-stage: first positions only, then cell+positions")
     parser.add_argument("--fire-only", action="store_true",
                         help="Use only FIRE optimizer (more robust for defects/H atoms)")
+    parser.add_argument("--spinpol", action="store_true",
+                        help="Enable spin-polarized calculation (for radicals, vacancies)")
+    parser.add_argument("--magmom", type=float, default=0.5,
+                        help="Initial magnetic moment for undercoordinated atoms (default: 0.5)")
     parser.add_argument("--supercell", type=int, nargs=3, default=None,
                         metavar=("NX", "NY", "NZ"),
                         help="Create supercell before optimization (e.g., 2 2 1)")
@@ -336,6 +423,8 @@ def main():
         if args.gpu:
             parprint(f"  WARNING: --gpu only works with --lcao mode")
     parprint(f"  kpts: {kpts} ({np.prod(kpts)} k-points)")
+    if args.spinpol:
+        parprint(f"  spin: POLARIZED (for radicals/vacancies)")
     parprint(f"  smearing: {args.smearing} eV")
     parprint(f"  fmax: {fmax} eV/Å")
     parprint(f"  convergence: {convergence}")
@@ -348,6 +437,21 @@ def main():
         parprint(f"  two-stage: yes")
     if use_fast:
         parprint(f"  fast mode: yes (coarse → fine)")
+    
+    # Setup spin polarization
+    spinpol = args.spinpol
+    if spinpol:
+        magmoms, modified_indices = setup_magnetic_moments(atoms, args.magmom)
+        atoms.set_initial_magnetic_moments(magmoms)
+        parprint(f"\nSpin polarization enabled:")
+        parprint(f"  Initial magmom: {args.magmom} μB on undercoordinated atoms")
+        if modified_indices:
+            symbols = atoms.get_chemical_symbols()
+            parprint(f"  Atoms with magmom: {[(i, symbols[i]) for i in modified_indices]}")
+        else:
+            parprint(f"  WARNING: No undercoordinated atoms found!")
+            parprint(f"           Setting uniform magmom={args.magmom} on all atoms")
+            atoms.set_initial_magnetic_moments([args.magmom] * len(atoms))
 
     # Dry run - just print info and exit
     if args.dry_run:
@@ -398,6 +502,7 @@ def main():
                 mode='lcao',
                 basis=args.basis,  # Use same basis as fine stage
                 xc="PBE",
+                spinpol=spinpol,
                 occupations=FermiDirac(args.smearing),
                 kpts=coarse_kpts,
                 txt=coarse_log,
@@ -409,6 +514,7 @@ def main():
             coarse_calc = GPAW(
                 mode=PW(coarse_ecut),
                 xc="PBE",
+                spinpol=spinpol,
                 occupations=FermiDirac(args.smearing),
                 kpts=coarse_kpts,
                 txt=coarse_log,
@@ -455,6 +561,7 @@ def main():
             mode='lcao',
             basis=args.basis,
             xc="PBE",
+            spinpol=spinpol,
             occupations=FermiDirac(args.smearing),
             kpts=kpts,
             txt=gpaw_log,
@@ -467,6 +574,7 @@ def main():
         calc = GPAW(
             mode=PW(ecut),
             xc="PBE",
+            spinpol=spinpol,
             occupations=FermiDirac(args.smearing),
             kpts=kpts,
             txt=gpaw_log,
@@ -551,6 +659,22 @@ def main():
     parprint(f"{'='*50}")
     parprint(f"  Final energy:   {e1:.6f} eV")
     parprint(f"  Final max force: {fmax1:.6f} eV/Å")
+    
+    # Report magnetic moments if spin-polarized
+    if spinpol:
+        try:
+            magmoms = atoms.get_magnetic_moments()
+            total_magmom = sum(magmoms)
+            max_magmom = max(abs(m) for m in magmoms)
+            parprint(f"  Total magmom:   {total_magmom:.4f} μB")
+            parprint(f"  Max |magmom|:   {max_magmom:.4f} μB")
+            # Show atoms with significant magnetic moment
+            significant = [(i, atoms.get_chemical_symbols()[i], m) 
+                          for i, m in enumerate(magmoms) if abs(m) > 0.1]
+            if significant:
+                parprint(f"  Magnetic atoms: {significant[:5]}{'...' if len(significant) > 5 else ''}")
+        except Exception:
+            parprint(f"  (Could not retrieve magnetic moments)")
 
     parprint(f"\nFinal structure:")
     parprint(f"  Cell (a, b, c): {atoms.cell.lengths()}")
